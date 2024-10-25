@@ -25,10 +25,12 @@ dl_url <- "https://data.nextstrain.org/files/workflows/forecasts-ncov/open/nexts
 tmp_file <- tempfile()
 download.file(dl_url, tmp_file)
 variantcts <- read_tsv(gzfile(tmp_file))
+dir.create('raw-data/historic_counts', showWarnings = FALSE)
 write_csv(variantcts, paste0('raw-data/historic_counts/', Sys.Date(), '_variantcts.csv'))
 rm(tmp_file)
 
-variantcts <- read_csv(paste0('raw-data/historic_counts/', Sys.Date(), '_variantcts.csv'))
+
+# variantcts <- read_csv(paste0('raw-data/historic_counts/', Sys.Date(), '_variantcts.csv')) ## Use if running manually
 
 # Clean the variant locations in data -------------------------------------
 variantcts |> 
