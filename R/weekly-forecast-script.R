@@ -236,7 +236,7 @@ get_gam_fit <- function(clade_data){
 }
 
 
-pdf("figures/state-forecasts-trajectory.pdf", width = 12, height = 9, bg='white')
+pdf(paste0('figures/', todays_date, 'trajectory-forecasts.pdf'), width = 12, height = 9, bg='white')
 for(loc in unique(prediction_plotting$location)) {
   
   loc_data <- full_fcast_df |> 
