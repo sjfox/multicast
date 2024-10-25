@@ -238,7 +238,8 @@ get_gam_fit <- function(clade_data){
 }
 
 
-pdf(paste0('figures/', todays_date, 'trajectory-forecasts.pdf'), width = 12, height = 9, bg='white')
+dir.create('figures/rt-forecasts', showWarnings = FALSE)
+pdf(paste0('figures/rt-forecasts/', todays_date, 'trajectory-forecasts.pdf'), width = 12, height = 9, bg='white')
 for(loc in unique(prediction_plotting$location)) {
   
   loc_data <- full_fcast_df |> 
@@ -305,12 +306,14 @@ predictions_for_submission |>
   filter(abs(prev-1)>.001)
 
 
+dir.create('processed-data/rt-forecasts', showWarnings = FALSE)
 predictions_for_submission |> 
   write_parquet(sink = paste0('processed-data/rt-forecasts/', todays_date, '-UGA-multicast.parquet'))
 
 
 # Check the file ----------------------------------------------------------
 ## Move the file to the proper directory and then use hubvalidations to check it
+## Something is broken for some reason - need to investigate it later
 library(hubValidations)
 validate_submission(hub_path = '../variant-nowcast-hub/',
                     file_path = 'UGA-multicast/2024-10-23-UGA-multicast.parquet') -> sub_validation
