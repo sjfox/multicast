@@ -315,14 +315,21 @@ predictions_for_submission |>
 ## Move the file to the proper directory and then use hubvalidations to check it
 ## Something is broken for some reason - need to investigate it later
 library(hubValidations)
-validate_submission(hub_path = '../variant-nowcast-hub/',
-                    file_path = 'UGA-multicast/2024-10-23-UGA-multicast.parquet') -> sub_validation
+
+
+setwd('../variant-nowcast-hub/')
+validate_submission(hub_path = '.',
+                    file_path = 'UGA-multicast/2024-11-06-UGA-multicast.parquet') -> sub_validation
+
+
 
 # Want all \green checkmarks
 sub_validation
 
 ## Want to make sure there are no missing required values
 sub_validation$req_vals$missing
+
+setwd('../multicast/')
 
 # Trash code not used -----------------------------------------------------
 
