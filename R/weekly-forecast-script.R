@@ -59,9 +59,8 @@ variantcts |>
 
 
 # Read in clades for this week --------------------------------------------
-# todays_date <- ymd('2024-10-23') ## Only use this if you want to test out script
 todays_date <- Sys.Date()
-
+# todays_date <- ymd('2024-11-13') ## Only use this if you want to test out script not on wednesday
 
 json_location <- paste0("https://raw.githubusercontent.com/reichlab/variant-nowcast-hub/refs/heads/main/auxiliary-data/modeled-clades/",
                         todays_date,
@@ -109,13 +108,30 @@ all_possible_data |>
   mutate(sequences = ifelse(is.na(sequences), 0, sequences)) |> 
   ungroup() -> full_fcast_df
 
+## This code was used to add in sequences that were missing to help with rare variants, but
+## It's too arbitrary of an approach so no longer used
+# full_fcast_df |> 
+#   group_by(location, clade) |> 
+#   summarize(n = sum(sequences)) |> 
+#   filter(n ==0) |> 
+#   ungroup() -> missing_clade_locations
+# 
+# for(i in 1:nrow(missing_clade_locations)){
+#   temp <- missing_clade_locations |> slice(i)
+#   
+#   full_fcast_df |> 
+#     bind_rows(tibble(location = temp$location,
+#                      clade = fcast_clades[which(!(fcast_clades %in% c('recombinant', 'other')))],
+#                      date = todays_date - days(1),
+#                      data_dates = TRUE,
+#                      sequences = 1)) -> full_fcast_df
+# }
 
 
 ## Now make the actually tibble for forecasting
 full_fcast_df |> 
   inner_join(time_control_df, by = 'date') |> 
   uncount(sequences)  -> mod_fcast_df
-
 
 
 # Fit the model and estimate uncertainty ----------------------------------
@@ -241,6 +257,7 @@ get_gam_fit <- function(clade_data){
 dir.create('figures/rt-forecasts', showWarnings = FALSE)
 pdf(paste0('figures/rt-forecasts/', todays_date, 'trajectory-forecasts.pdf'), width = 12, height = 9, bg='white')
 for(loc in unique(prediction_plotting$location)) {
+  print(loc)
   
   loc_data <- full_fcast_df |> 
     filter(location == loc) |> 
@@ -255,20 +272,29 @@ for(loc in unique(prediction_plotting$location)) {
     mutate(time = as.numeric(time)) |> 
     left_join(time_control_df, by = 'time')
   
-  print(loc)
-  loc_data |> 
-    nest(data = c('date', 'time', 'prob', 'sequences')) |> 
-    mutate(preds = map(.x = data, .f = get_gam_fit)) |> 
-    select(-data) |> 
-    unnest(preds) |> 
-    ggplot(aes(date, pred, color = clade)) +
-    geom_point(data = loc_data, aes(x = date, y =prob, color = clade)) +
-    geom_line(lty = 2) +
-    facet_wrap(~clade) +
-    labs(title = loc, x = NULL, y = "Prevalence", color = NULL, fill = NULL) +
-    theme(legend.position = 'none') +
-    geom_line(data = loc_fit_probs, aes(date, prevalence, group = samp), alpha = .2) -> loc_plot
-  
+  if(nrow(loc_data) == 0){
+    loc_fit_probs |> 
+      ggplot(aes(date, prevalence, color = clade, group = samp), alpha = .2) +
+      geom_line() +
+      facet_wrap(~clade) +
+      labs(title = loc, x = NULL, y = "Prevalence", color = NULL, fill = NULL) +
+      scale_x_date(limits = c((ymd(todays_date)-days(360)), ymd(todays_date))) +
+      theme(legend.position = 'none') -> loc_plot
+  } else{
+    loc_data |> 
+      nest(data = c('date', 'time', 'prob', 'sequences')) |> 
+      mutate(preds = map(.x = data, .f = get_gam_fit)) |> 
+      select(-data) |> 
+      unnest(preds) |> 
+      ggplot(aes(date, pred, color = clade)) +
+      geom_point(data = loc_data, aes(x = date, y =prob, color = clade)) +
+      geom_line(lty = 2) +
+      facet_wrap(~clade) +
+      labs(title = loc, x = NULL, y = "Prevalence", color = NULL, fill = NULL) +
+      theme(legend.position = 'none') +
+      geom_line(data = loc_fit_probs, aes(date, prevalence, group = samp), alpha = .2) -> loc_plot
+  }
+    
   print(loc_plot)
 }
 dev.off()
@@ -313,15 +339,12 @@ predictions_for_submission |>
 
 # Check the file ----------------------------------------------------------
 ## Move the file to the proper directory and then use hubvalidations to check it
-## Something is broken for some reason - need to investigate it later
 library(hubValidations)
 
 
 setwd('../variant-nowcast-hub/')
 validate_submission(hub_path = '.',
-                    file_path = 'UGA-multicast/2024-11-06-UGA-multicast.parquet') -> sub_validation
-
-
+                    file_path = paste0('UGA-multicast/', todays_date, '-UGA-multicast.parquet')) -> sub_validation
 
 # Want all \green checkmarks
 sub_validation
