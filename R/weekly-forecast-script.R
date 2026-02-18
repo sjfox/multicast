@@ -60,7 +60,7 @@ variantcts |>
 
 # Read in clades for this week --------------------------------------------
 todays_date <- Sys.Date()
-# todays_date <- ymd('2024-11-13') ## Only use this if you want to test out script not on wednesday
+# todays_date <- ymd('2025-07-16') ## Only use this if you want to test out script not on wednesday
 
 json_location <- paste0("https://raw.githubusercontent.com/reichlab/variant-nowcast-hub/refs/heads/main/auxiliary-data/modeled-clades/",
                         todays_date,
@@ -68,13 +68,16 @@ json_location <- paste0("https://raw.githubusercontent.com/reichlab/variant-nowc
 clades <- fromJSON(paste(readLines(json_location), collapse=""))
 fcast_clades <- clades$clades
 
+# fcast_clades_original <- fcast_clades
+# fcast_clades <- fcast_clades[2:10]
+
 # Do final cleaning for the analysis --------------------------------------
 ## Currently removing the most recent 30 days, because it's so noisy and messes with predictions (something to test later though)
 ## Currently only using data back 180 days (something to test later on)
 ## Parameters used to control the amount of data used and the dates used for model predictions
 fcast_days_from_today <- 10
 hindcast_days_from_today <- 31
-days_to_look_back <- 180
+days_to_look_back <- 90
 recent_days_to_drop <- 0
 
 ## Supposed to forecast 42 total dates, 31 back and 10 forward
@@ -133,6 +136,12 @@ full_fcast_df |>
   inner_join(time_control_df, by = 'date') |> 
   uncount(sequences)  -> mod_fcast_df
 
+mod_fcast_df |> 
+  inner_join(mod_fcast_df |> 
+               count(location) |> 
+               filter(n>=5) |> select(location), by = 'location') -> mod_fcast_df
+
+
 
 # Fit the model and estimate uncertainty ----------------------------------
 library(fastDummies)
@@ -177,7 +186,8 @@ get_multinom_loc_preds <- function(location_name,
     group_by(time) |> 
     mutate(samp = seq_along(time)) -> trajectory_preds
   
-  colnames(trajectory_preds) <- c('time', sort(unique(df$clade)), 'samp')
+  clade_levels <- if (!is.null(multinomial_model$lev)) multinomial_model$lev else sort(unique(df$clade))
+  colnames(trajectory_preds) <- c('time', clade_levels, 'samp')
   trajectory_preds |> 
     gather(clade, prevalence, -time, -samp) |> 
     mutate(location = location_name) -> trajectory_preds
@@ -205,6 +215,7 @@ dummy_cols(all_possible_data |>
 
 
 pred_samp_df |> 
+  arrange(time) |> 
   nest(data = -location) |> 
   mutate(preds = map2(location, data, 
                       get_multinom_loc_preds,
@@ -323,13 +334,59 @@ prediction_trajectories |>
          output_type,
          output_type_id,
          value) -> predictions_for_submission
+
+## Ensure every sample trajectory has all required clades; fill missing with zero prevalence
+required_submission_index <- predictions_for_submission |>
+  distinct(nowcast_date, target_date, location, output_type, output_type_id)
+
+predictions_for_submission |>
+  anti_join(tibble(clade = fcast_clades), by = "clade") |>
+  distinct(clade) -> unexpected_clades
+
+if (nrow(unexpected_clades) > 0) {
+  warning(paste0("Dropping unexpected clades from submission: ",
+                 paste(unexpected_clades$clade, collapse = ", ")))
+}
+
+predictions_for_submission |>
+  filter(clade %in% fcast_clades) -> predictions_for_submission
+
+required_submission_index |>
+  tidyr::crossing(tibble(clade = fcast_clades)) |>
+  anti_join(predictions_for_submission,
+            by = c("nowcast_date", "target_date", "location",
+                   "output_type", "output_type_id", "clade")) |>
+  nrow() -> missing_clade_rows_before_fill
+
+if (missing_clade_rows_before_fill > 0) {
+  message(paste0("Adding ", missing_clade_rows_before_fill, " missing clade rows with value = 0."))
+}
+
+required_submission_index |>
+  tidyr::crossing(tibble(clade = fcast_clades)) |>
+  left_join(predictions_for_submission,
+            by = c("nowcast_date", "target_date", "location",
+                   "output_type", "output_type_id", "clade")) |>
+  mutate(value = replace_na(value, 0)) |>
+  arrange(target_date, location, output_type_id, clade) -> predictions_for_submission
+
+missing_clade_rows_after_fill <- required_submission_index |>
+  tidyr::crossing(tibble(clade = fcast_clades)) |>
+  anti_join(predictions_for_submission,
+            by = c("nowcast_date", "target_date", "location",
+                   "output_type", "output_type_id", "clade")) |>
+  nrow()
+
+if (missing_clade_rows_after_fill > 0) {
+  warning(paste0("Submission still missing ", missing_clade_rows_after_fill, " clade rows after completion."))
+}
            
 ## There should be no rows that show up for this, because that would mean
 ## trajectories sum about 100% for prevalence
 predictions_for_submission |> 
   group_by(location, target_date, output_type_id) |> 
   summarize(prev = sum(value)) |> 
-  filter(abs(prev-1)>.001)
+  filter(abs(prev-1)>.001) 
 
 
 dir.create('processed-data/rt-forecasts', showWarnings = FALSE)

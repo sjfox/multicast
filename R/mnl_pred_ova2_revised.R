@@ -88,14 +88,26 @@ mnl_pred_ova2_revised <- function (model, data, x, xvals, z = NULL, z_value = NU
     stop("Please supply a dataset or a x-variable with variation")
   }
   output[["nVariation"]] <- nseq
-  categories <- sort(unique(eval(parse(text = paste0("data$", 
-                                                     dv)))))
-  J <- length(categories)
+  if (!is.null(model$lev)) {
+    categories <- model$lev
+    J <- length(categories)
+  }
+  else {
+    categories <- sort(unique(eval(parse(text = paste0("data$", 
+                                                       dv)))))
+    J <- length(categories)
+  }
   if (J < 3) {
     stop("Please supply a dataset with a dependent variable that has a sufficient number of outcomes (> 2)")
   }
   output[["ChoiceCategories"]] <- categories
   output[["nChoices"]] <- J
+  expected_cols <- (J - 1) * ncoef
+  if (ncol(S) < expected_cols) {
+    stop(paste0("Model coefficients and category count do not align. ",
+                "This usually happens when prediction data includes outcome levels not estimated in the model.\n",
+                "ncol(S)=", ncol(S), ", expected at least ", expected_cols, "."))
+  }
   ninteraction <- sum(grepl(":", model$coefnames))
   
   X <- matrix(NA, ncol = ncoef, nrow = obs)
