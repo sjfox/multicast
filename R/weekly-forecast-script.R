@@ -141,104 +141,222 @@ mod_fcast_df |>
                count(location) |> 
                filter(n>=5) |> select(location), by = 'location') -> mod_fcast_df
 
+time_center <- mean(mod_fcast_df$time)
+time_scale <- sd(mod_fcast_df$time)
+mod_fcast_df <- mod_fcast_df |>
+  mutate(time_sc = (time - time_center) / time_scale)
 
 
-# Fit the model and estimate uncertainty ----------------------------------
-library(fastDummies)
+# Fit two-stage model and estimate uncertainty ----------------------------
+## Stage A: national clade trend over time
+## Stage B: regional clade offsets (no regional time slope)
 
-## This turns the categorical variable into dummy columns with zeroes and ones to indicate which 
-## location the data are a part of. multinom() does this automatically, but
-## it doesn't work with the mnlpred function I'm using for simulating
-## once we do it manually, it works with mnlpred... A bit annoying but not too bad
-dummy_cols(mod_fcast_df |> 
-             mutate(location = str_replace_all(location, fixed(" "), "")), select_columns = 'location') |> 
-  select(-location, ) |> 
-  select(clade, time, starts_with('location_')) -> mod_fcast_df
+mod_fcast_df <- mod_fcast_df |>
+  group_by(location) |>
+  mutate(location_total_sequences = n()) |>
+  ungroup() |>
+  filter(location_total_sequences >= 5) |>
+  select(-location_total_sequences)
 
-multi_mod <- multinom(clade ~ ., 
-                          data=mod_fcast_df, 
-                          maxit = 200,
-                          Hess=T) 
-
-
-# Get simulated trajectories and ribbons for plotting ------------------------------------
-
-get_multinom_loc_preds <- function(location_name, 
-                                   df, 
-                                   multinomial_model,
-                                   ntraj = 100){
-  # browser()
-  ## Function that gets trajectories and summary predictions for a given location
-  
-  print(paste0("Getting simulated trajectories for: ", location_name))
-  
-  mnl_pred_ova2_revised(multinomial_model, 
-                        data = df,
-                        x = 'time', 
-                        xvals = min(df$time):max(df$time), ## Can change to whatever "time" values you want to explore trajectories
-                        # xvals = seq(100,400, by = 20), 
-                        nsim = ntraj) -> preds
-  
-  ## Munges the prediction df output into proper format for using
-  apply(preds$P, 3, identity, simplify=FALSE) |> 
-    map(.f = as_tibble) |> 
-    bind_rows(.id = 'time') |> 
-    group_by(time) |> 
-    mutate(samp = seq_along(time)) -> trajectory_preds
-  
-  clade_levels <- if (!is.null(multinomial_model$lev)) multinomial_model$lev else sort(unique(df$clade))
-  colnames(trajectory_preds) <- c('time', clade_levels, 'samp')
-  trajectory_preds |> 
-    gather(clade, prevalence, -time, -samp) |> 
-    mutate(location = location_name) -> trajectory_preds
-  
-  ## If you want to plot a trajectory for specific clade/location to zoom in
-  # trajectory_preds |> 
-  #   filter(clade == '24F') |> 
-  #   ggplot(aes(as.numeric(time), prevalence, group = samp)) + geom_line()
-  
-  
-  preds$plotdata |> 
-    as_tibble() |> 
-    mutate(location = location_name) -> summary_preds
-  
-  list(trajectory_preds, summary_preds)
+present_clades <- fcast_clades[fcast_clades %in% unique(mod_fcast_df$clade)]
+if (length(present_clades) < 3) {
+  stop("Need at least 3 clades with observed counts to fit the two-stage multinomial model.")
 }
 
-## Creates the "predictor" variable database that is used with mnlpred function to
-## Get the prevalence estimates for each location at each timestep
-dummy_cols(all_possible_data |> 
-             inner_join(time_control_df, by = 'date') |> 
-             filter(location !='US') |> 
-             mutate(location = str_replace_all(location, fixed(" "), "")), 
-           select_columns = 'location') -> pred_samp_df
+mod_fcast_df <- mod_fcast_df |>
+  filter(clade %in% present_clades) |>
+  mutate(clade = factor(clade, levels = present_clades))
 
+stage_a_df <- mod_fcast_df |>
+  count(clade, time_sc, name = "weight")
 
-pred_samp_df |> 
-  arrange(time) |> 
-  nest(data = -location) |> 
-  mutate(preds = map2(location, data, 
-                      get_multinom_loc_preds,
-                      multinomial_model = multi_mod)) -> all_predictions
+stage_b_df <- mod_fcast_df |>
+  count(clade, location, name = "weight")
+
+decay_value <- 0.05
+# For stronger regularization, try: decay_value <- 0.1
+
+stage_a_mod <- multinom(clade ~ time_sc,
+                        data = stage_a_df,
+                        weights = weight,
+                        maxit = 300,
+                        Hess = TRUE,
+                        decay = decay_value,
+                        trace = FALSE)
+
+stage_b_mod <- multinom(clade ~ location,
+                        data = stage_b_df,
+                        weights = weight,
+                        maxit = 300,
+                        Hess = TRUE,
+                        decay = decay_value,
+                        trace = FALSE)
+
+simulate_multinom_eta <- function(multinom_model, newdata, nsim = 100) {
+  design_mat <- model.matrix(delete.response(terms(multinom_model)), newdata)
+  coef_mat <- coef(multinom_model)
+  if (is.vector(coef_mat)) {
+    coef_mat <- matrix(coef_mat, nrow = 1)
+  }
+  coef_mu <- as.vector(t(coef_mat))
+  coef_cov <- MASS::ginv(multinom_model$Hessian)
+  coef_draws <- MASS::mvrnorm(nsim, coef_mu, coef_cov)
+  if (is.vector(coef_draws)) {
+    coef_draws <- matrix(coef_draws, nrow = 1)
+  }
   
+  classes <- multinom_model$lev
+  nclasses <- length(classes)
+  eta <- array(0, dim = c(nrow(newdata), nclasses, nsim))
+  
+  for (sim in seq_len(nsim)) {
+    beta_sim <- matrix(coef_draws[sim, seq_along(coef_mu)],
+                       nrow = nclasses - 1,
+                       byrow = TRUE)
+    eta[, 2:nclasses, sim] <- design_mat %*% t(beta_sim)
+  }
+  
+  list(eta = eta, classes = classes)
+}
 
-all_predictions$preds |> 
-  map(.f = function(x) x[[1]]) |> 
-  bind_rows() |> 
-  left_join(locs |> 
-              select(location_name) |> 
-              mutate(location = str_replace_all(location_name, fixed(" "), ""))) |> 
-  mutate(location = location_name) |> 
-  select(-location_name) -> prediction_trajectories
+predict_two_stage_probs <- function(stage_a_model, stage_b_model, pred_df, nsim = 100) {
+  stage_a <- simulate_multinom_eta(stage_a_model, pred_df, nsim = nsim)
+  stage_b <- simulate_multinom_eta(stage_b_model, pred_df, nsim = nsim)
+  
+  if (!setequal(stage_a$classes, stage_b$classes)) {
+    stop("Stage A and Stage B clade levels do not match.")
+  }
+  stage_b_order <- match(stage_a$classes, stage_b$classes)
+  stage_b_eta <- stage_b$eta[, stage_b_order, , drop = FALSE]
+  
+  nobs <- nrow(pred_df)
+  nclasses <- length(stage_a$classes)
+  probs <- array(NA_real_, dim = c(nsim, nclasses, nobs))
+  
+  for (sim in seq_len(nsim)) {
+    logits <- stage_a$eta[, , sim] + stage_b_eta[, , sim]
+    logits <- logits - apply(logits, 1, max)
+    exp_logits <- exp(logits)
+    sim_probs <- exp_logits / rowSums(exp_logits)
+    probs[sim, , ] <- t(sim_probs)
+  }
+  
+  list(P = probs, classes = stage_a$classes)
+}
 
-all_predictions$preds |> 
-  map(.f = function(x) x[[2]]) |> 
-  bind_rows() |> 
-  left_join(locs |> 
-              select(location_name) |> 
-              mutate(location = str_replace_all(location_name, fixed(" "), ""))) |> 
-  mutate(location = location_name) |> 
-  select(-location_name) -> prediction_plotting
+predict_stage_a_probs <- function(stage_a_model, pred_df, nsim = 100) {
+  stage_a <- simulate_multinom_eta(stage_a_model, pred_df, nsim = nsim)
+  nobs <- nrow(pred_df)
+  nclasses <- length(stage_a$classes)
+  probs <- array(NA_real_, dim = c(nsim, nclasses, nobs))
+  
+  for (sim in seq_len(nsim)) {
+    logits <- stage_a$eta[, , sim]
+    logits <- logits - apply(logits, 1, max)
+    exp_logits <- exp(logits)
+    sim_probs <- exp_logits / rowSums(exp_logits)
+    probs[sim, , ] <- t(sim_probs)
+  }
+  
+  list(P = probs, classes = stage_a$classes)
+}
+
+pred_samp_df <- all_possible_data |>
+  inner_join(time_control_df, by = "date") |>
+  filter(location != "US") |>
+  distinct(location, date, time) |>
+  inner_join(mod_fcast_df |> distinct(location), by = "location") |>
+  arrange(location, time) |>
+  mutate(time_sc = (time - time_center) / time_scale)
+
+two_stage_preds <- predict_two_stage_probs(stage_a_mod, stage_b_mod, pred_samp_df, nsim = 100)
+
+trajectory_preds <- apply(two_stage_preds$P, 3, identity, simplify = FALSE) |>
+  map(as_tibble) |>
+  bind_rows(.id = "obs_id") |>
+  mutate(obs_id = as.integer(obs_id)) |>
+  left_join(pred_samp_df |>
+              mutate(obs_id = row_number()) |>
+              select(obs_id, location, date, time),
+            by = "obs_id") |>
+  group_by(obs_id) |>
+  mutate(samp = row_number()) |>
+  ungroup()
+
+prob_cols <- setdiff(colnames(trajectory_preds), c("obs_id", "location", "date", "time", "samp"))
+if (length(prob_cols) != length(two_stage_preds$classes)) {
+  stop(paste0("Prediction column mismatch. Found ", length(prob_cols),
+              " probability columns but ", length(two_stage_preds$classes), " clades."))
+}
+colnames(trajectory_preds)[match(prob_cols, colnames(trajectory_preds))] <- two_stage_preds$classes
+
+prediction_trajectories <- trajectory_preds |>
+  select(location, date, time, samp, all_of(two_stage_preds$classes)) |>
+  gather(clade, prevalence, -location, -date, -time, -samp)
+
+prediction_plotting <- prediction_trajectories |>
+  group_by(location, date, time, clade) |>
+  summarize(mean = mean(prevalence),
+            lower = quantile(prevalence, probs = 0.025),
+            upper = quantile(prevalence, probs = 0.975),
+            .groups = "drop")
+
+# Plot national stage-A trajectories --------------------------------------
+national_pred_df <- time_control_df |>
+  distinct(date, time) |>
+  arrange(time) |>
+  mutate(time_sc = (time - time_center) / time_scale)
+
+national_stage_a_preds <- predict_stage_a_probs(stage_a_mod, national_pred_df, nsim = 200)
+
+national_plot_df <- apply(national_stage_a_preds$P, 3, identity, simplify = FALSE) |>
+  map(as_tibble) |>
+  bind_rows(.id = "obs_id") |>
+  mutate(obs_id = as.integer(obs_id)) |>
+  left_join(national_pred_df |>
+              mutate(obs_id = row_number()) |>
+              select(obs_id, date, time),
+            by = "obs_id")
+
+national_prob_cols <- setdiff(colnames(national_plot_df), c("obs_id", "date", "time"))
+colnames(national_plot_df)[match(national_prob_cols, colnames(national_plot_df))] <- national_stage_a_preds$classes
+
+national_plot_df <- national_plot_df |>
+  gather(clade, prevalence, -obs_id, -date, -time) |>
+  group_by(date, time, clade) |>
+  summarize(mean = mean(prevalence),
+            lower = quantile(prevalence, probs = 0.025),
+            upper = quantile(prevalence, probs = 0.975),
+            .groups = "drop")
+
+national_obs_df <- full_fcast_df |>
+  filter(clade %in% present_clades) |>
+  group_by(date, clade) |>
+  summarize(sequences = sum(sequences), .groups = "drop") |>
+  group_by(date) |>
+  mutate(prob = sequences / sum(sequences)) |>
+  ungroup() |>
+  inner_join(national_pred_df |> select(date), by = "date")
+
+ggplot(national_plot_df, aes(date, mean, color = clade, fill = clade)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = .2, color = NA) +
+  geom_line() +
+  geom_line(data = national_obs_df, aes(y = prob, color = clade), linetype = 2) +
+  geom_point(data = national_obs_df, aes(y = prob, color = clade), size = 1) +
+  facet_wrap(~clade) +
+  labs(title = "National Stage-A Clade Trajectories",
+       x = NULL,
+       y = "Prevalence",
+       color = NULL,
+       fill = NULL) +
+  theme(legend.position = 'none') -> national_stage_a_plot
+
+dir.create('figures/rt-forecasts', showWarnings = FALSE)
+ggsave(filename = paste0('figures/rt-forecasts/', todays_date, '-national-stage-a-trajectories.pdf'),
+       plot = national_stage_a_plot,
+       width = 12,
+       height = 9,
+       bg = 'white')
 
 
 
@@ -280,8 +398,7 @@ for(loc in unique(prediction_plotting$location)) {
   
   loc_fit_probs <- prediction_trajectories |> 
     filter(location == loc) |> 
-    mutate(time = as.numeric(time)) |> 
-    left_join(time_control_df, by = 'time')
+    mutate(time = as.numeric(time))
   
   if(nrow(loc_data) == 0){
     loc_fit_probs |> 
@@ -317,7 +434,7 @@ dev.off()
 prediction_trajectories |>
   ungroup() |> 
   mutate(time = as.numeric(time)) |> 
-  left_join(time_control_df, by = 'time') |> 
+  left_join(time_control_df |> select(time, forecast_date), by = 'time') |> 
   left_join(locs |> select(location_name, abbreviation), by = c('location' = 'location_name')) |> 
   filter(forecast_date) |> 
   arrange(time) |> 
