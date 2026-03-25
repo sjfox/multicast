@@ -77,7 +77,7 @@ fcast_clades <- clades$clades
 ## Parameters used to control the amount of data used and the dates used for model predictions
 fcast_days_from_today <- 10
 hindcast_days_from_today <- 31
-days_to_look_back <- 90
+days_to_look_back <- 120
 recent_days_to_drop <- 0
 
 ## Supposed to forecast 42 total dates, 31 back and 10 forward
@@ -139,7 +139,7 @@ full_fcast_df |>
 mod_fcast_df |> 
   inner_join(mod_fcast_df |> 
                count(location) |> 
-               filter(n>=5) |> select(location), by = 'location') -> mod_fcast_df
+               filter(n>=100) |> select(location), by = 'location') -> mod_fcast_df
 
 time_center <- mean(mod_fcast_df$time)
 time_scale <- sd(mod_fcast_df$time)
@@ -170,22 +170,11 @@ mod_fcast_df <- mod_fcast_df |>
 stage_a_df <- mod_fcast_df |>
   count(clade, time_sc, name = "weight")
 
-stage_b_df <- mod_fcast_df |>
-  count(clade, location, name = "weight")
-
 decay_value <- 0.05
 # For stronger regularization, try: decay_value <- 0.1
 
 stage_a_mod <- multinom(clade ~ time_sc,
                         data = stage_a_df,
-                        weights = weight,
-                        maxit = 300,
-                        Hess = TRUE,
-                        decay = decay_value,
-                        trace = FALSE)
-
-stage_b_mod <- multinom(clade ~ location,
-                        data = stage_b_df,
                         weights = weight,
                         maxit = 300,
                         Hess = TRUE,
@@ -219,31 +208,6 @@ simulate_multinom_eta <- function(multinom_model, newdata, nsim = 100) {
   list(eta = eta, classes = classes)
 }
 
-predict_two_stage_probs <- function(stage_a_model, stage_b_model, pred_df, nsim = 100) {
-  stage_a <- simulate_multinom_eta(stage_a_model, pred_df, nsim = nsim)
-  stage_b <- simulate_multinom_eta(stage_b_model, pred_df, nsim = nsim)
-  
-  if (!setequal(stage_a$classes, stage_b$classes)) {
-    stop("Stage A and Stage B clade levels do not match.")
-  }
-  stage_b_order <- match(stage_a$classes, stage_b$classes)
-  stage_b_eta <- stage_b$eta[, stage_b_order, , drop = FALSE]
-  
-  nobs <- nrow(pred_df)
-  nclasses <- length(stage_a$classes)
-  probs <- array(NA_real_, dim = c(nsim, nclasses, nobs))
-  
-  for (sim in seq_len(nsim)) {
-    logits <- stage_a$eta[, , sim] + stage_b_eta[, , sim]
-    logits <- logits - apply(logits, 1, max)
-    exp_logits <- exp(logits)
-    sim_probs <- exp_logits / rowSums(exp_logits)
-    probs[sim, , ] <- t(sim_probs)
-  }
-  
-  list(P = probs, classes = stage_a$classes)
-}
-
 predict_stage_a_probs <- function(stage_a_model, pred_df, nsim = 100) {
   stage_a <- simulate_multinom_eta(stage_a_model, pred_df, nsim = nsim)
   nobs <- nrow(pred_df)
@@ -261,6 +225,102 @@ predict_stage_a_probs <- function(stage_a_model, pred_df, nsim = 100) {
   list(P = probs, classes = stage_a$classes)
 }
 
+assign_region <- function(abbrev) {
+  case_when(
+    abbrev %in% c("CT", "ME", "MA", "NH", "RI", "VT", "NJ", "NY", "PA") ~ "Northeast",
+    abbrev %in% c("IL", "IN", "MI", "OH", "WI", "IA", "KS", "MN", "MO", "NE", "ND", "SD") ~ "Midwest",
+    abbrev %in% c("DE", "DC", "FL", "GA", "MD", "NC", "SC", "VA", "WV", "AL", "KY", "MS", "TN", "AR", "LA", "OK", "TX") ~ "South",
+    abbrev %in% c("AZ", "CO", "ID", "MT", "NV", "NM", "UT", "WY", "AK", "CA", "HI", "OR", "WA") ~ "West",
+    TRUE ~ "Other"
+  )
+}
+
+location_region_map <- locs |>
+  filter(location_name != "US") |>
+  select(location = location_name, abbreviation) |>
+  mutate(region = assign_region(abbreviation)) |>
+  select(location, region)
+
+training_counts <- full_fcast_df |>
+  filter(clade %in% present_clades, location != "US") |>
+  inner_join(time_control_df |> select(date), by = "date") |>
+  inner_join(location_region_map, by = "location")
+
+nat_props <- training_counts |>
+  group_by(clade) |>
+  summarize(n = sum(sequences), .groups = "drop") |>
+  mutate(nat_prop = n / sum(n)) |>
+  select(clade, nat_prop)
+
+tau_region <- 200
+tau_state <- 50
+state_pool_k <- 200
+
+region_props <- training_counts |>
+  group_by(region, clade) |>
+  summarize(n = sum(sequences), .groups = "drop") |>
+  tidyr::complete(region, clade = present_clades, fill = list(n = 0)) |>
+  group_by(region) |>
+  mutate(region_total = sum(n)) |>
+  ungroup() |>
+  left_join(nat_props, by = "clade") |>
+  mutate(region_prop = (n + tau_region * nat_prop) / (region_total + tau_region),
+         region_offset = region_prop / nat_prop)
+
+state_props <- training_counts |>
+  group_by(location, region, clade) |>
+  summarize(n = sum(sequences), .groups = "drop") |>
+  tidyr::complete(location, clade = present_clades, fill = list(n = 0)) |>
+  left_join(location_region_map, by = "location") |>
+  select(location, region = region.y, clade, n) |>
+  group_by(location, region) |>
+  mutate(state_total = sum(n)) |>
+  ungroup() |>
+  left_join(region_props |> select(region, clade, region_prop), by = c("region", "clade")) |>
+  mutate(state_prop = (n + tau_state * region_prop) / (state_total + tau_state),
+         state_offset = state_prop / region_prop) |>
+  select(location, clade, state_total, state_offset)
+
+offset_table <- location_region_map |>
+  tidyr::crossing(clade = present_clades) |>
+  left_join(region_props |> select(region, clade, region_offset), by = c("region", "clade")) |>
+  left_join(state_props, by = c("location", "clade")) |>
+  mutate(state_total = replace_na(state_total, 0),
+         state_offset = replace_na(state_offset, 1),
+         region_offset = replace_na(region_offset, 1),
+         state_weight = state_total / (state_total + state_pool_k),
+         total_offset = region_offset * (state_offset ^ state_weight))
+
+location_offset_mat <- offset_table |>
+  select(location, clade, total_offset) |>
+  tidyr::pivot_wider(names_from = clade, values_from = total_offset) |>
+  arrange(location)
+
+location_offset_matrix <- as.matrix(location_offset_mat |> select(all_of(present_clades)))
+rownames(location_offset_matrix) <- location_offset_mat$location
+
+predict_hierarchical_probs <- function(stage_a_model, pred_df, offset_matrix, nsim = 100) {
+  stage_a <- predict_stage_a_probs(stage_a_model, pred_df, nsim = nsim)
+  classes <- stage_a$classes
+  probs <- stage_a$P
+  
+  for (i in seq_len(nrow(pred_df))) {
+    loc_i <- pred_df$location[i]
+    if (loc_i %in% rownames(offset_matrix)) {
+      offsets <- offset_matrix[loc_i, classes]
+    } else {
+      offsets <- rep(1, length(classes))
+      names(offsets) <- classes
+    }
+    for (sim in seq_len(nsim)) {
+      p <- probs[sim, , i] * offsets
+      probs[sim, , i] <- p / sum(p)
+    }
+  }
+  
+  list(P = probs, classes = classes)
+}
+
 pred_samp_df <- all_possible_data |>
   inner_join(time_control_df, by = "date") |>
   filter(location != "US") |>
@@ -269,7 +329,7 @@ pred_samp_df <- all_possible_data |>
   arrange(location, time) |>
   mutate(time_sc = (time - time_center) / time_scale)
 
-two_stage_preds <- predict_two_stage_probs(stage_a_mod, stage_b_mod, pred_samp_df, nsim = 100)
+two_stage_preds <- predict_hierarchical_probs(stage_a_mod, pred_samp_df, location_offset_matrix, nsim = 100)
 
 trajectory_preds <- apply(two_stage_preds$P, 3, identity, simplify = FALSE) |>
   map(as_tibble) |>
